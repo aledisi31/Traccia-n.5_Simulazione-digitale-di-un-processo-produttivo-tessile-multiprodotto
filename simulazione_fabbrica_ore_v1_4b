@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""
+Simulazione di un processo produttivo multiprodotto in una fabbrica tessile
+Versione v1.4b — Fermi operatori/macchine + riepilogo produzione completo nel terminale + barra di avanzamento
+
+
+import random
+import time
+import csv
+from collections import deque, defaultdict
+from datetime import datetime
+
+TURNI = deque([
+    {"nome": "Mattina", "orario": "06:00-14:00"},
+    {"nome": "Pomeriggio", "orario": "14:00-22:00"},
+    {"nome": "Notte", "orario": "22:00-06:00"}
+])
+
+MACCHINE_PER_FASE = {
+    "Taglio": 4,
+    "Cucitura": 6,
+    "Controllo Qualità": 3,
+    "Imballaggio": 3
+}
+
+FASI = list(MACCHINE_PER_FASE.keys())
+ORE_SIMULATE = 24
+DURATA_TURNO_SIMULATO = ORE_SIMULATE / 3  # 8 ore per turno
+
+class Operatore:
+    def __init__(self, nome: str):
+        self.nome = nome
+        self.occupato = False
+        self.indisponibile_fino = None
+
+class Macchina:
+    def __init__(self, id_macchina: str, fase: str):
+        self.id_macchina = id_macchina
+        self.fase = fase
+        self.occupata = False
+        self.guasta_fino = None
+
+class Prodotto:
+    def __init__(self, nome: str, tempi_fase: dict):
+        self.nome = nome
+        self.tempi_fase = tempi_fase
+
+class Fabbrica:
+    def __init__(self):
+        self.macchine = {
+            fase: [Macchina(f"{fase}_{i+1}", fase) for i in range(n)]
+            for fase, n in MACCHINE_PER_FASE.items()
+        }
+        self.turno_corrente = None
+        self.operatori_turno = []
+        self.mappa_macchina_operatore = {}
+        self.tempo_inizio_turno = time.time()
+        self.log_produzione = []
+        self.produzione_oraria = defaultdict(lambda: defaultdict(int))
+        self.log_fermi_operatori = []
+        self.log_fermi_macchine = []
+        self.contatore_prodotti_completati = defaultdict(int)
+        self.contatore_per_turno = defaultdict(lambda: defaultdict(int))
+
+    def _cambia_turno(self):
+        """Cambia turno e assegna gli operatori e le macchine con possibili indisponibilità."""
+        turno = TURNI[0]
+        TURNI.rotate(-1)
+        self.turno_corrente = turno["nome"]
+        self.operatori_turno = []
+
+        if self.turno_corrente == "Notte":
+            for fase in MACCHINE_PER_FASE.keys():
+                self.operatori_turno.append(Operatore(f"{self.turno_corrente}_{fase}_Operatore"))
+        else:
+            for fase, num_macchine in MACCHINE_PER_FASE.items():
+                for i in range(num_macchine):
+                    op = Operatore(f"{self.turno_corrente}_{fase}_Operatore{i+1}")
+                    self.operatori_turno.append(op)
+
+        self.mappa_macchina_operatore = {
+            m.id_macchina: op for m, op in zip(
+                [mac for fase in self.macchine.values() for mac in fase],
+                self.operatori_turno * (len(self.macchine) // len(self.operatori_turno) + 1)
+            )
+        }
+
+        # Simula assenze e fermi operatori
+        p_assente_turno = 0.1
+        p_indisponibile_parziale = 0.2
+        for op in self.operatori_turno:
+            if random.random() < p_assente_turno:
+                op.indisponibile_fino = DURATA_TURNO_SIMULATO
+                self.log_fermi_operatori.append((self.turno_corrente, op.nome, DURATA_TURNO_SIMULATO))
+            elif random.random() < p_indisponibile_parziale:
+                durata_stop = random.randint(1, 3)
+                ora_stop = random.randint(0, int(DURATA_TURNO_SIMULATO - durata_stop))
+                op.indisponibile_fino = ora_stop + durata_stop
+                self.log_fermi_operatori.append((self.turno_corrente, op.nome, durata_stop))
+
+        # Simula guasti macchine
+        p_guasto_turno = 0.05
+        p_guasto_breve = 0.15
+        for fase, macchine in self.macchine.items():
+            for m in macchine:
+                if random.random() < p_guasto_turno:
+                    m.guasta_fino = DURATA_TURNO_SIMULATO
+                    self.log_fermi_macchine.append((self.turno_corrente, m.id_macchina, DURATA_TURNO_SIMULATO))
+                elif random.random() < p_guasto_breve:
+                    durata_fermo = random.randint(1, 3)
+                    ora_inizio_fermo = random.randint(0, int(DURATA_TURNO_SIMULATO - durata_fermo))
+                    m.guasta_fino = ora_inizio_fermo + durata_fermo
+                    self.log_fermi_macchine.append((self.turno_corrente, m.id_macchina, durata_fermo))
+
+        self.tempo_inizio_turno = time.time()
+
+    def _check_turno(self):
+        if time.time() - self.tempo_inizio_turno >= DURATA_TURNO_SIMULATO:
+            self._cambia_turno()
+
+    def _risorse_disponibili(self, fase: str):
+        macchine_libere = [
+            m for m in self.macchine[fase]
+            if not m.occupata and (m.guasta_fino is None or (time.time() - self.tempo_inizio_turno) >= m.guasta_fino)
+        ]
+        if not macchine_libere:
+            return None, None
+        macchina = random.choice(macchine_libere)
+        operatore = self.mappa_macchina_operatore.get(macchina.id_macchina)
+
+        if operatore and operatore.indisponibile_fino is not None:
+            ora_corrente = (time.time() - self.tempo_inizio_turno)
+            if ora_corrente < operatore.indisponibile_fino:
+                return None, None
+
+        return macchina, operatore
+
+    def esegui_produzione_parallela(self, prodotti: list, max_paralleli: int = 5, durata_massima: float = 24):
+        """Simula la produzione multiprodotto considerando indisponibilità e guasti."""
+        self._cambia_turno()
+        start_time = time.time()
+        tempo_totale_produzione = 0.0
+        in_lavorazione = []
+
+        print("Avvio simulazione (v1.4b - riepilogo completo)\n")
+        print("Produzione in corso:", end=" ", flush=True)
+
+        while time.time() - start_time < durata_massima:
+            self._check_turno()
+
+            while len(in_lavorazione) < max_paralleli:
+                nuovo_prodotto = {"oggetto": random.choice(prodotti), "fase_corrente": 0}
+                in_lavorazione.append(nuovo_prodotto)
+
+            completati = []
+            for prodotto in in_lavorazione:
+                fase = FASI[prodotto["fase_corrente"]]
+                macchina, operatore = self._risorse_disponibili(fase)
+
+                if macchina and operatore:
+                    macchina.occupata = True
+                    operatore.occupato = True
+
+                    durata = round(random.uniform(
+                        prodotto["oggetto"].tempi_fase[fase] * 0.8,
+                        prodotto["oggetto"].tempi_fase[fase] * 1.2
+                    ), 2)
+                    tempo_totale_produzione += durata
+
+                    ora_simulata = int((time.time() - start_time) % 24)
+                    quantita = random.randint(1, 5)
+                    chiave = (ora_simulata, macchina.id_macchina, operatore.nome, self.turno_corrente, prodotto["oggetto"].nome)
+                    self.produzione_oraria[chiave]["quantita"] += quantita
+
+                    time.sleep(0.01)
+                    macchina.occupata = False
+                    operatore.occupato = False
+
+                    prodotto["fase_corrente"] += 1
+
+                    if prodotto["fase_corrente"] >= len(FASI):
+                        completati.append(prodotto)
+                        print("█", end="", flush=True)
+
+            for p in completati:
+                in_lavorazione.remove(p)
+                nome = p["oggetto"].nome
+                self.contatore_prodotti_completati[nome] += 1
+                self.contatore_per_turno[self.turno_corrente][nome] += 1
+
+        # Riepilogo finale completo
+        print("\n\nSimulazione completata!\n")
+        print("Produzione completata.")
+        for nome_prodotto, quantita in self.contatore_prodotti_completati.items():
+            print(f"  {nome_prodotto}: {quantita} unità")
+
+        print("\nProduzione per turno:")
+        for turno_nome in ["Mattina", "Pomeriggio", "Notte"]:
+            prodotti_turno = self.contatore_per_turno.get(turno_nome, {})
+            print(f"  Turno {turno_nome}:")
+            if prodotti_turno:
+                for prodotto, quantita in prodotti_turno.items():
+                    print(f"    {prodotto}: {quantita} unità")
+            else:
+                print("    Nessuna produzione registrata.")
+
+        unita_totali = sum(self.contatore_prodotti_completati.values())
+        makespan_ore = time.time() - start_time
+        tempo_medio_per_unita = (tempo_totale_produzione / unita_totali) if unita_totali else 0.0
+
+        print(f"\nTempo calendario (makespan): {makespan_ore:.2f} ore")
+        print(f"Tempo complessivo stimato (somma durate fasi): {tempo_totale_produzione:.2f} ore")
+        print(f"Tempo medio di lavorazione per unità: {tempo_medio_per_unita:.2f} ore/pezzo")
+
+        self.salva_log_csv()
+
+    def salva_log_csv(self):
+        """Salva la produzione oraria e i fermi in un file CSV univoco."""
+        nome_file = f"log_produzione_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        chiavi = ["ora_simulata", "prodotto", "fase", "macchina", "operatore", "turno", "quantita"]
+        with open(nome_file, "w", newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=chiavi)
+            writer.writeheader()
+            for (ora, macchina_id, operatore_nome, turno, prodotto_nome), dati in self.produzione_oraria.items():
+                fase = macchina_id.split("_")[0]
+                writer.writerow({
+                    "ora_simulata": ora,
+                    "prodotto": prodotto_nome,
+                    "fase": fase,
+                    "macchina": macchina_id,
+                    "operatore": operatore_nome,
+                    "turno": turno,
+                    "quantita": dati["quantita"]
+                })
+
+            writer.writerow({})
+            writer.writerow({"ora_simulata": "# --- OPERATORI INDISPONIBILI ---"})
+            writer.writerow({"ora_simulata": "turno,operatore,periodo_indisponibilita_ore"})
+            for turno, op, durata in self.log_fermi_operatori:
+                writer.writerow({"ora_simulata": f"{turno},{op},{durata:.1f}"})
+
+            writer.writerow({})
+            writer.writerow({"ora_simulata": "# --- MACCHINE GUASTE ---"})
+            writer.writerow({"ora_simulata": "turno,macchina,periodo_guasto_ore"})
+            for turno, mac, durata in self.log_fermi_macchine:
+                writer.writerow({"ora_simulata": f"{turno},{mac},{durata:.1f}"})
+
+        print(f"Dati salvati in: {nome_file}\n")
+
+if __name__ == "__main__":
+    cappellino = Prodotto("Cappellino", {"Taglio": 1.0, "Cucitura": 1.5, "Controllo Qualità": 0.8, "Imballaggio": 0.4})
+    maglietta = Prodotto("Maglietta", {"Taglio": 1.2, "Cucitura": 1.8, "Controllo Qualità": 1.0, "Imballaggio": 0.6})
+    pantaloni = Prodotto("Pantaloni", {"Taglio": 1.3, "Cucitura": 2.0, "Controllo Qualità": 1.1, "Imballaggio": 0.7})
+
+    fabbrica = Fabbrica()
+    fabbrica.esegui_produzione_parallela([cappellino, maglietta, pantaloni], max_paralleli=5, durata_massima=24)
